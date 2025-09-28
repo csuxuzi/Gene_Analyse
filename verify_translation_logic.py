@@ -720,7 +720,6 @@ def report_full_protein_and_exon_effect(transcript_full: dict, target_exon: dict
     for line in wrap_seq(protein_seq, 60):
         print(f"  {line}")
 
-    print(f"Debug_Segments_Info:{segments}")
     # 2) 定位目标外显子的编码片段
     seg = next((s for s in segments if s["exon_id"] == target_exon["id"]), None)
     if not seg:
