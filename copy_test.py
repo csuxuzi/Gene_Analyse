@@ -805,7 +805,12 @@ def report_full_protein_and_exon_effect(transcript_full: dict, target_exon: dict
     else:
         amino_acid_from_mut_codon = 'X'
     ref_aa_at_site = ref_exon_aa_strict[pos_to_report_dna_based] if 0 <= pos_to_report_dna_based < len(ref_exon_aa_strict) else ''
-    if amino_acid_from_mut_codon == '_':
+    
+    if delta_nt > 0 and delta_nt % 3 == 0:
+        effect_type = "不移码插入 (In-frame Insertion)"
+    elif delta_nt < 0 and delta_nt % 3 == 0:
+        effect_type = "不移码缺失 (In-frame Deletion)"
+    elif amino_acid_from_mut_codon == '_':
         effect_type = "无义突变 (Nonsense)"
     elif aa_start_strict == 1 and pos_to_report_dna_based == 0 and ref_aa_at_site == 'M':
         effect_type = "起始密码子变异 (Start-loss)"
@@ -820,22 +825,37 @@ def report_full_protein_and_exon_effect(transcript_full: dict, target_exon: dict
         
     # 3. 【混合定位】根据变异类型，决定影响位置 pos_to_report
     pos_to_report = -1
+    ref_aa_for_report, mut_aa_for_report = '?', '?'
     point_mutation_types = ["同义突变 (Synonymous)", "错义突变 (Missense)", "无义突变 (Nonsense)", "起始密码子变异 (Start-loss)"]
-    
     if effect_type in point_mutation_types:
         # 对于点突变，DNA位置最准确
         pos_to_report = pos_to_report_dna_based
-    else:
-        # 对于Indel，第一个变化的氨基酸位置最准确
+        if 0 <= pos_to_report < len(ref_exon_aa_strict):
+            ref_aa_for_report = ref_exon_aa_strict[pos_to_report]
+            # ... (处理无义突变等)
+            mut_aa_for_report = mut_exon_aa_strict[pos_to_report] if pos_to_report < len(mut_exon_aa_strict) else '?'
+            if effect_type == "无义突变 (Nonsense)": mut_aa_for_report = '_'
+    else: # 处理 Frameshift 和 In-frame Indel
         min_len = min(len(ref_exon_aa_strict), len(mut_exon_aa_strict))
         first_diff_idx = -1
         for i in range(min_len):
             if ref_exon_aa_strict[i] != mut_exon_aa_strict[i]:
-                first_diff_idx = i
-                break
+                first_diff_idx = i; break
         if first_diff_idx == -1 and len(ref_exon_aa_strict) != len(mut_exon_aa_strict):
             first_diff_idx = min_len
         pos_to_report = first_diff_idx
+
+        if effect_type == "不移码缺失 (In-frame Deletion)":
+            ref_aa_for_report = ref_exon_aa_strict[pos_to_report]
+            mut_aa_for_report = "-" # 使用 '-' 代表缺失
+        elif effect_type == "不移码插入 (In-frame Insertion)":
+            # 插入发生在 pos_to_report 的位置之前
+            pos_to_report = pos_to_report -1 # 修正位置，与VEP的 'after pos X' 概念对齐
+            ref_aa_for_report = "+" # 使用 '+' 代表插入
+            mut_aa_for_report = mut_exon_aa_strict[pos_to_report + 1]
+        else: # 移码突变
+             ref_aa_for_report = ref_exon_aa_strict[pos_to_report]
+             mut_aa_for_report = mut_exon_aa_strict[pos_to_report]
     
     # 3. 打印突变前后的蛋白片段
     aa_end_strict = aa_start_strict + len(ref_exon_aa_strict) - 1
@@ -854,14 +874,12 @@ def report_full_protein_and_exon_effect(transcript_full: dict, target_exon: dict
     print("\n[只看该外显子片段的影响]")
     print(f"  - 变异类型: {effect_type}")
 
-    if 0 <= pos_to_report < max(len(ref_exon_aa_strict), len(mut_exon_aa_for_display) + 1):
+    if pos_to_report != -1:
         aa_global = aa_start_strict + pos_to_report
-        ref_aa = ref_exon_aa_strict[pos_to_report] if pos_to_report < len(ref_exon_aa_strict) else '?'
-        mut_aa = mut_exon_aa_for_display[pos_to_report] if pos_to_report < len(mut_exon_aa_for_display) else '?'
-
+        
         print(f"  - 影响位置: 该外显子翻译片段的第 {pos_to_report + 1} 个氨基酸")
         print(f"  - 全蛋白位置: 氨基酸 {aa_global}")
-        print(f"  - 具体改变: {ref_aa} -> {mut_aa}")
+        print(f"  - 具体改变: {ref_aa_for_report} -> {mut_aa_for_report}")
         
         # 打印上下文窗口
         left = max(0, pos_to_report - 10)
@@ -882,6 +900,21 @@ def report_full_protein_and_exon_effect(transcript_full: dict, target_exon: dict
         print(f"  - 片段长度改变或无法精确定位。")
 
     print("=========================================================\n")
+    
+    # 【新增】: 将分析结果打包成字典并返回
+    # 如果是同义突变，则没有氨基酸变化，返回None
+    if effect_type == "同义突变 (Synonymous)":
+        return None
+        
+    if effect_type not in ["同义突变 (Synonymous)"]:
+        return {
+            'type': effect_type,
+            'position': aa_global,
+            'before': ref_aa_for_report,
+            'after': mut_aa_for_report
+        }
+    
+    return None
 
 
 def process_variant_with_uniprot_workflow(gene_id: str, target_exon_info: dict, ref: str, alt: str,
@@ -1135,47 +1168,99 @@ def get_variant_hgvs(chrom: str, pos: int, ref: Optional[str], alt: Optional[str
         return None
 
 
+# =================================================================
+#  第一处修改：用下面这个更强大的版本替换旧的 parse_hgvsp 函数
+# =================================================================
+
 def parse_hgvsp(hgvsp: str) -> Optional[Dict]:
     """
-    解析 HGVS p. 字符串 (例如 'p.Trp24Cys') 并返回一个包含关键信息的字典。
-    支持 missense, nonsense, 和 frameshift (只解析起始点)。
+    (最终优化版) 解析 HGVS p. 字符串，兼容多种复杂情况。
+    - 错义/无义: p.Trp24Cys, p.Arg97Ter
+    - 移码: p.Leu397HisfsTer25, p.Arg97fs
+    - 缺失: p.Tyr369del, p.Gly12_Gln15del
+    - 未知后果: p.Met1?
+    - 插入: p.Lys23_Gly24insSer
+    - 同义: p.(=)
     """
     if not hgvsp or ':p.' not in hgvsp:
         return None
 
     try:
         p_part = hgvsp.split(':p.', 1)[1]
+
+        # 情况1: 同义突变 p.(=)
+        if p_part == '(=)':
+            return {'type': 'synonymous'}
+
+        # 情况2: 未知后果 p.Met1?
+        match = re.match(r'^([A-Z][a-z]{2})(\d+)\?$', p_part)
+        if match:
+            return {
+                'position': int(match.group(2)),
+                'before': AA_3TO1.get(match.group(1)),
+                'after': '?',
+                'type': 'unknown'
+            }
+        # 情况2.5: 同义突变 p.Arg195=
+        match = re.match(r'^([A-Z][a-z]{2})(\d+)=', p_part)
+        if match:
+            before_3 = match.group(1)
+            before_1 = AA_3TO1.get(before_3)
+            return {
+                'position': int(match.group(2)),
+                'before': before_1,
+                'after': before_1, # 变异后氨基酸与变异前相同
+                'type': 'synonymous'
+            }
+        # 情况3: 单氨基酸缺失 p.Tyr369del
+        match = re.match(r'^([A-Z][a-z]{2})(\d+)del$', p_part)
+        if match:
+            return {
+                'position': int(match.group(2)),
+                'before': AA_3TO1.get(match.group(1)),
+                'after': '-', # 用 '-' 代表缺失
+                'type': 'in-frame-deletion'
+            }
         
-        # 正则表达式匹配 氨基酸(3位) + 位置 + 变化
-        # 变化部分可以是 氨基酸(3位), Ter(终止), 或者 fs... (移码)
-        match = re.match(r'^([A-Z][a-z]{2})(\d+)([A-Z][a-z]{2}|Ter|fs.*)$', p_part)
-        
-        if not match:
-            # 无法匹配，可能是同义突变 p.(=) 或其他复杂情况
-            return None
+        # 情况4: 插入 p.Lys23_Gly24insSer
+        match = re.match(r'^[A-Z][a-z]{2}(\d+)_.*ins([A-Z][a-z]{2})$', p_part)
+        if match:
+            return {
+                # 我们将插入位置定义在第一个氨基酸之后
+                'position': int(match.group(1)),
+                'before': '+', # 用 '+' 代表插入
+                'after': AA_3TO1.get(match.group(2)),
+                'type': 'in-frame-insertion'
+            }
+            
+        # 情况5: 错义, 无义, 移码 (通用匹配)
+        match = re.match(r'^([A-Z][a-z]{2})(\d+)(.*)$', p_part)
+        if match:
+            before_3 = match.group(1)
+            position = int(match.group(2))
+            after_part = match.group(3)
+            
+            before_1 = AA_3TO1.get(before_3)
+            if not before_1: return {'type': 'unparsed', 'raw': p_part}
 
-        before_3 = match.group(1)
-        position = int(match.group(2))
-        after_raw = match.group(3)
+            after_1 = '?'
+            effect_type = 'unknown'
 
-        before_1 = AA_3TO1.get(before_3)
-        after_1 = None
+            if 'fs' in after_part:
+                effect_type = 'frameshift'
+                fs_match = re.match(r'^([A-Z][a-z]{2})', after_part)
+                after_1 = AA_3TO1.get(fs_match.group(1)) if fs_match else 'fs'
+            elif after_part in AA_3TO1:
+                after_1 = AA_3TO1.get(after_part)
+                effect_type = 'nonsense' if after_1 == '_' else 'missense'
+            elif len(after_part) > 3 and after_part[:3] in AA_3TO1: # 兼容 p.Trp24Cys 格式
+                 after_1 = AA_3TO1.get(after_part[:3])
+                 effect_type = 'missense'
 
-        if after_raw.startswith('fs'):
-            # 对于移码，我们只知道起始变化，后续是未知的
-            # VEP有时会提供第一个变化的氨基酸，例如 p.Leu397HisfsTer25
-            fs_match = re.match(r'^([A-Z][a-z]{2})', after_raw)
-            if fs_match:
-                after_1 = AA_3TO1.get(fs_match.group(1), 'Frameshift')
-            else:
-                 after_1 = 'Frameshift'
-        else:
-            after_1 = AA_3TO1.get(after_raw)
+            return {'position': position, 'before': before_1, 'after': after_1, 'type': effect_type}
 
-        if before_1 is None or after_1 is None:
-            return None
-
-        return {'position': position, 'before': before_1, 'after': after_1}
+        # 所有情况都未匹配
+        return {'type': 'unparsed', 'raw': p_part}
 
     except (AttributeError, IndexError):
         return None
@@ -1200,6 +1285,9 @@ def generate_variant_context_report_raw(desc_id: str):
     
     # 步骤 1: 确定变异所在基因
     gene_name, gene_id = "N/A", "N/A"
+    
+    # 添加标志位
+    flag = True
     try:
         ext_overlap = f"/overlap/region/human/{chromosome}:{variant_position}-{variant_position}?feature=gene"
         r_overlap = requests.get(ENSEMBL_SERVER + ext_overlap, headers=JSON_HEADERS)
@@ -1249,10 +1337,66 @@ def generate_variant_context_report_raw(desc_id: str):
                         print(f"变异预览：{hgvsp}")
                         analyze_exon_location(target_exon, transcript_full)
                         print("  > 开始进行蛋白质影响分析...")
-                        report_full_protein_and_exon_effect(
+                        local_result = report_full_protein_and_exon_effect(
                             transcript_full, target_exon, ref_allele, alt_allele, variant_position
                         )
                         protein_analysis_completed = True
+                        # 2. 解析VEP的hgvsp结果
+                        vep_result = parse_hgvsp(hgvsp)
+
+                        # 3. 进行比对和校验
+                        print("\n---【本地分析 vs VEP 校验】---")
+                        
+                        is_local_synonymous = local_result is None
+                        is_vep_synonymous = vep_result is not None and vep_result.get('type') == 'synonymous'
+
+                        # ---【核心修正逻辑】---
+                        if is_local_synonymous and is_vep_synonymous:
+                            print("  > ✅ [校验成功] 本地分析与 VEP 均判定为同义突变。")
+                           
+                            
+                        elif local_result and vep_result:
+                            # 提取本地分析的变异类型
+                            local_type = local_result.get('type', 'unknown')
+                            
+                            pos_match = local_result.get('position') == vep_result.get('position')
+                            before_match = local_result.get('before') == vep_result.get('before')
+                            
+                            # 【智能比对 'after'】
+                            after_match = False
+                            vep_after = vep_result.get('after')
+                            local_after = local_result.get('after')
+
+                            if 'frameshift' in vep_result.get('type', ''):
+                                # 对于移码，只要本地也判断为移码，就认为基本一致
+                                after_match = '移码' in local_type
+                            elif vep_after == '-': # VEP认为是缺失
+                                after_match = '缺失' in local_type
+                            elif vep_result.get('before') == '+': # VEP认为是插入
+                                after_match = '插入' in local_type
+                            else:
+                                # 其他情况直接比对
+                                after_match = local_after == vep_after
+
+                            print(f"  - 氨基酸位置比对: {'一致' if pos_match else '不一致'}")
+                            print(f"  - 变异前氨基酸比对: {'一致' if before_match else '不一致'}")
+                            print(f"  - 变异后果比对: {'一致' if after_match else '不一致'}")
+                            
+                            if pos_match and before_match:
+                                print("  > ✅ [校验成功] 本地分析结果与 VEP 注释一致。")
+                                
+                            else:
+                                print("  > ❌ [校验失败] 本地分析结果与 VEP 注释存在差异。")
+                                print(f"    - 本地分析: Pos={local_result.get('position')}, Change={local_result.get('before')}->{local_result.get('after')} (Type: {local_type})")
+                                print(f"    - VEP 注释: Pos={vep_result.get('position')}, Change={vep_result.get('before')}->{vep_result.get('after')} (Type: {vep_result.get('type')})")
+                                flag = False
+                        else:
+                            print("  > ⚠️ [校验警告] 无法进行完整比对 (一方未返回有效结果)。")
+                            print(f"    - 本地分析结果: {local_result}")
+                            print(f"    - VEP 解析结果: {vep_result}")
+                            flag = False
+                        
+                        print("-" * 30)
                     else:
                         # 情况B: 变异位于外显子的【非编码区 UTR】
                         utr_type = "5' UTR" if variant_position < cds_min else "3' UTR"
@@ -1315,6 +1459,7 @@ def generate_variant_context_report_raw(desc_id: str):
             print_flanking_report(desc_id, gene_name, gene_id, chromosome, variant_position, sequence, flank_size, ref_allele, alt_allele,category)
         except requests.exceptions.RequestException as err:
             print(f"错误：获取序列片段失败。原因: {err}")
+    return flag
 
 def generate_variant_context_report(desc_id: str):
     """
@@ -1564,6 +1709,12 @@ def read_vcf_and_process(file_path: str, record_limit: int = 5):
             print(f"{line.id}: {line.description}")
 
     print(f"\n---VCF数据记录（前{record_limit}条）---")
+    
+    sum = 0
+    success = 0
+    failure = 0
+    failed_ids = []  # 新增一个列表来存储处理失败的ID
+    
     for i, record in enumerate(reader):
         if record_limit is not None and i >= record_limit:
             break
@@ -1587,13 +1738,32 @@ def read_vcf_and_process(file_path: str, record_limit: int = 5):
         if record.ID:
             for single_id in record.ID:
                 if '_' in single_id and len(single_id.split('_')) == 4:
-                    generate_variant_context_report_raw(single_id)
+                    sum += 1
+                    result = generate_variant_context_report_raw(single_id)
+                    if result:
+                        success += 1
+                    else:
+                        failure += 1
+                        # ---【修改2】: 当处理失败时，记录下该ID ---
+                        failed_ids.append(single_id)
                 else:
                     print(f"\nID '{single_id}' 不符合 'CHROM_POS_REF_ALT' 格式，已跳过序列分析。")
         else:
             print("\n该记录ID字段为空，跳过序列上下文分析。")
         
-        print("\n" + "-"*20)
+    print("\n" + "-"*20)
+    print(f"总结:")
+    print(f"共处理 {sum} 条记录")
+    print(f"  - 成功: {success} 条")
+    print(f"  - 失败: {failure} 条")
+
+    if failed_ids: # 仅当列表不为空时打印
+        print("\n处理失败的ID列表:")
+        for fid in failed_ids:
+            print(f"  - {fid}")
+    
+    print("-" * 20)
+        
 
 # if __name__ == "__main__":
 #     vcf_file_path = "rgc_me_variant_frequencies_chrY_20231004.vcf"
@@ -1602,10 +1772,26 @@ def read_vcf_and_process(file_path: str, record_limit: int = 5):
 #     read_vcf_and_process(file_path=vcf_file_path, record_limit=100)
 
 # 调试脚本
+
 if __name__ == "__main__":
+    # # 移码突变-增
+    # generate_variant_context_report_raw("24_12725143_G_GT")
+    # # 移码突变-删
+    generate_variant_context_report_raw("24_12738176_ATATCT_A")
+    # # 同义突变
+    # generate_variant_context_report_raw("24_2787019_C_A")
+    # # 剪切区域突变
+    # generate_variant_context_report_raw("24_12738152_T_G")
+    # # 错义突变
+    # generate_variant_context_report_raw("24_12736242_A_G")
+    # # 无义突变
+    # generate_variant_context_report_raw("24_2787010_G_C")
+    # # 起始密码子变异
+    # generate_variant_context_report_raw("24_12709448_A_G")
+    # # 不移码突变-插
+    # generate_variant_context_report_raw("24_12911867_G_GACC")
+    # # 不移码突变-删
+    # generate_variant_context_report_raw("24_2961289_GTCA_G")
     
-    generate_variant_context_report_raw("24_12725143_G_GT")
-    #generate_variant_context_report_raw("24_12738176_ATATCT_A")
-    #generate_variant_context_report_raw("24_2787019_C_A")
-    #generate_variant_context_report_raw("24_12738152_T_G")
     
+    # generate_variant_context_report_raw("24_2787129_GT_G")

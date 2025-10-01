@@ -118,5 +118,5 @@ def verify_translation_logic_fixed(transcript_id: str):
 
 if __name__ == "__main__":
     # 我们来验证之前匹配到的那个“健康”的转录本
-    healthy_transcript_id = "ENST00000331397"
+    healthy_transcript_id = "ENST00000383070"
     verify_translation_logic_fixed(healthy_transcript_id)
