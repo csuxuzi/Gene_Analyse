@@ -3,9 +3,12 @@ import requests
 from datetime import datetime
 import json
 import math
-
+import re
+from typing import Dict, Optional
 ENSEMBL_SERVER = "https://rest.ensembl.org"
 JSON_HEADERS = {"Content-Type": "application/json"}
+DONOR_SPLICE_REGION_MAX = 10
+ACCEPTOR_SPLICE_REGION_MAX = 8
 
 CODON_TABLE = {
     'ATA':'I', 'ATC':'I', 'ATT':'I', 'ATG':'M',
@@ -25,6 +28,15 @@ CODON_TABLE = {
     'TAC':'Y', 'TAT':'Y', 'TAA':'_', 'TAG':'_',
     'TGC':'C', 'TGT':'C', 'TGA':'_', 'TGG':'W',
 }
+
+AA_3TO1 = {
+    'Ala': 'A', 'Arg': 'R', 'Asn': 'N', 'Asp': 'D', 'Cys': 'C',
+    'Gln': 'Q', 'Glu': 'E', 'Gly': 'G', 'His': 'H', 'Ile': 'I',
+    'Leu': 'L', 'Lys': 'K', 'Met': 'M', 'Phe': 'F', 'Pro': 'P',
+    'Ser': 'S', 'Thr': 'T', 'Trp': 'W', 'Tyr': 'Y', 'Val': 'V',
+    'Ter': '_',  # Ter/Stop is represented as '_' to match our internal representation
+}
+
 
 def translate_dna_std(dna):
     # 你自己的翻译函数，确保用核基因的标准遗传密码表，最后把末端终止符去掉
@@ -423,6 +435,8 @@ def translate_cds(cds_seq: str) -> str:
     for i in range(0, len(cds_seq) - (len(cds_seq) % 3), 3):
         codon = cds_seq[i:i+3]
         amino_acid = CODON_TABLE.get(codon, 'X') # 'X' for unknown codon
+        if amino_acid == '_':
+            break
         protein_seq.append(amino_acid)
     return "".join(protein_seq)
 
@@ -432,6 +446,8 @@ def translate_dna(dna_seq: str) -> str:
     for i in range(0, len(dna_seq) - 2, 3):
         codon = dna_seq[i:i+3].upper()
         amino_acid = CODON_TABLE.get(codon, 'X') # 'X' for unknown codons
+        if amino_acid == '_':
+            break
         protein.append(amino_acid)
     return "".join(protein)
 
@@ -705,20 +721,25 @@ def find_exon_on_transcript(transcript_info: dict, variant_position: int) -> dic
 def report_full_protein_and_exon_effect(transcript_full: dict, target_exon: dict,
                                         ref: str, alt: str, variant_position: int):
     """
+    (优化版)
     打印：
-      1) 整个基因（该转录本）所翻译的蛋白序列
-      2) 当前外显子（严格strict）突变前的蛋白片段
-      3) 当前外显子（严格strict）突变后的蛋白片段
-      4) 只针对该外显子片段的影响分析
+      1) 整个转录本翻译的全长蛋白序列
+      2) 目标外显子“严格片段”突变前/后的蛋白序列
+      3) 对该片段的影响分析，无论突变类型（包括同义突变），都将标注出氨基酸位置
     """
     print("\n================= 蛋白与外显子片段报告 =================")
 
     # 1) 拼CDS并拿到官方全蛋白、segments
-    cds_seq, protein_seq, segments = build_cds_and_segment_map(transcript_full)
+    try:
+        cds_seq, protein_seq, segments = build_cds_and_segment_map(transcript_full)
+    except ValueError as e:
+        print(f"\n[错误] {e}")
+        return
+        
     prot_len = len(protein_seq)
-    print(f"[全蛋白] 长度: {prot_len} aa")
-    for line in wrap_seq(protein_seq, 60):
-        print(f"  {line}")
+    # print(f"[全蛋白] 长度: {prot_len} aa")
+    # for line in wrap_seq(protein_seq, 60):
+    #     print(f"  {line}")
 
     # 2) 定位目标外显子的编码片段
     seg = next((s for s in segments if s["exon_id"] == target_exon["id"]), None)
@@ -726,123 +747,142 @@ def report_full_protein_and_exon_effect(transcript_full: dict, target_exon: dict
         print("\n[提示] 该外显子不在CDS中（UTR），因此没有对应的蛋白片段。")
         return
 
-    e_start = seg["exon_start"]
-    e_end   = seg["exon_end"]
-    e_strand = seg["exon_strand"]
+    e_start, e_end, e_strand = seg["exon_start"], seg["exon_end"], seg["exon_strand"]
     i0 = seg["i0"]               # 编码片段在外显子序列中的起始索引
     L  = seg["length_nt"]        # 编码长度（nt）
     offset = seg["cds_offset"]   # 该片段在CDS中的0-based nt偏移
     phase = offset % 3
-    n_skip = (3 - phase) % 3     # 丢弃到最近密码子边界的碱基数
+    n_skip = (3 - phase) % 3     # 为对齐读码框，需跳过的碱基数
     n_full = (L - n_skip) // 3
 
-    # 外显子“严格”片段在全蛋白中的aa坐标
     if n_full <= 0:
         print("\n[提示] 该外显子在CDS中的编码长度不足以形成完整的密码子（strict 片段为空）。")
         return
 
+    # 外显子“严格”片段在全蛋白中的aa坐标
     aa_start_strict = ((offset + n_skip) // 3) + 1  # 1-based
     aa_end_strict   = aa_start_strict + n_full - 1
-
     ref_exon_aa_strict = protein_seq[aa_start_strict - 1: aa_end_strict]
 
     # 3) 构建“突变后”的外显子编码片段核苷酸序列并翻译
-    # 取外显子全序列（外显子自身方向）
     seq_json = requests.get(f"{ENSEMBL_SERVER}/sequence/id/{target_exon['id']}", headers=JSON_HEADERS).json()
     exon_seq = seq_json["seq"]
-    # 编码部分
-    part = exon_seq[i0:i0 + L]
+    part = exon_seq[i0:i0 + L] # 编码部分
 
-    # 变异相对外显子序列的索引
-    if not (e_start <= variant_position <= e_end):
-        # 变异不在该外显子上（极少见于多转录本不一致时）
-        idx_in_exon = None
-    else:
-        idx_in_exon = (variant_position - e_start) if e_strand == 1 else (e_end - variant_position)
+    # 计算变异在外显子序列中的相对索引
+    idx_in_exon = (variant_position - e_start) if e_strand == 1 else (e_end - variant_position)
+    # 变异在编码片段(part)中的相对索引
+    idx_in_part = idx_in_exon - i0
 
-    # 仅当变异落在该外显子的编码重叠区间内，才会影响 part
     mutated_part = part
-    if idx_in_exon is not None:
-        # 变异落在编码区间时的 part 内相对索引
-        idx_in_part = idx_in_exon - i0
-        if 0 <= idx_in_part <= len(part):
-            # 将 REF/ALT 转成与外显子序列方向一致的等效碱基
-            local_ref = ref
-            local_alt = alt
-            if e_strand == -1:
-                local_ref = reverse_complement(ref)
-                local_alt = reverse_complement(alt)
+    if 0 <= idx_in_part < len(part):
+        local_ref, local_alt = (ref, alt) if e_strand == 1 else (reverse_complement(ref), reverse_complement(alt))
+        mutated_part = part[:idx_in_part] + local_alt + part[idx_in_part + len(local_ref):]
 
-            # 检查是否真的在编码区间内
-            if seg["ovl_start"] <= variant_position <= seg["ovl_end"]:
-                mutated_part = part[:idx_in_part] + local_alt + part[idx_in_part + len(local_ref):]
-
-    # 严格视图：从第一个完整密码子开始翻译
     ref_part_strict = part[n_skip:]
     mut_part_strict = mutated_part[n_skip:]
-
-    ref_exon_aa_strict_manual = translate_dna(ref_part_strict)
     mut_exon_aa_strict = translate_dna(mut_part_strict)
+    delta_nt = len(mut_part_strict) - len(ref_part_strict)
 
-    # 4) 打印“外显子片段（突变前/后）”并做影响分析（仅限该外显子片段）
+    # # 4) 打印“外显子片段（突变前/后）”
+    # print("\n[外显子严格片段 | 突变前] (全蛋白位置: aa {}..{})".format(aa_start_strict, aa_end_strict))
+    # for line in wrap_seq(ref_exon_aa_strict, 60):
+    #     print(f"  {line}")
+
+    # print("\n[外显子严格片段 | 突变后] (起点对齐到同一全蛋白位置 aa {})".format(aa_start_strict))
+    # for line in wrap_seq(mut_exon_aa_strict, 60):
+    #     print(f"  {line}")
+
+    # --- 优化后的统一影响分析逻辑 ---
+    print("\n[只看该外显子片段的影响]")
+
+    effect_type = "未知"
+    pos_to_report_dna_based = (idx_in_part - n_skip) // 3
+    codon_start_in_strict_part = pos_to_report_dna_based * 3
+    if codon_start_in_strict_part >= 0 and (codon_start_in_strict_part + 3) <= len(mut_part_strict):
+        mut_codon = mut_part_strict[codon_start_in_strict_part : codon_start_in_strict_part + 3]
+        amino_acid_from_mut_codon = CODON_TABLE.get(mut_codon.upper(), 'X')
+    else:
+        amino_acid_from_mut_codon = 'X'
+    ref_aa_at_site = ref_exon_aa_strict[pos_to_report_dna_based] if 0 <= pos_to_report_dna_based < len(ref_exon_aa_strict) else ''
+    if amino_acid_from_mut_codon == '_':
+        effect_type = "无义突变 (Nonsense)"
+    elif aa_start_strict == 1 and pos_to_report_dna_based == 0 and ref_aa_at_site == 'M':
+        effect_type = "起始密码子变异 (Start-loss)"
+    elif delta_nt % 3 != 0:
+        effect_type = "移码突变 (Frameshift)"
+    elif ref_exon_aa_strict == mut_exon_aa_strict and delta_nt == 0:
+        effect_type = "同义突变 (Synonymous)"
+    elif delta_nt == 0:
+        effect_type = "错义突变 (Missense)"
+    else:
+        effect_type = "插入/缺失（不移码）(In-frame indel)"
+        
+    # 3. 【混合定位】根据变异类型，决定影响位置 pos_to_report
+    pos_to_report = -1
+    point_mutation_types = ["同义突变 (Synonymous)", "错义突变 (Missense)", "无义突变 (Nonsense)", "起始密码子变异 (Start-loss)"]
+    
+    if effect_type in point_mutation_types:
+        # 对于点突变，DNA位置最准确
+        pos_to_report = pos_to_report_dna_based
+    else:
+        # 对于Indel，第一个变化的氨基酸位置最准确
+        min_len = min(len(ref_exon_aa_strict), len(mut_exon_aa_strict))
+        first_diff_idx = -1
+        for i in range(min_len):
+            if ref_exon_aa_strict[i] != mut_exon_aa_strict[i]:
+                first_diff_idx = i
+                break
+        if first_diff_idx == -1 and len(ref_exon_aa_strict) != len(mut_exon_aa_strict):
+            first_diff_idx = min_len
+        pos_to_report = first_diff_idx
+    
+    # 3. 打印突变前后的蛋白片段
+    aa_end_strict = aa_start_strict + len(ref_exon_aa_strict) - 1
     print("\n[外显子严格片段 | 突变前] (全蛋白位置: aa {}..{})".format(aa_start_strict, aa_end_strict))
-    # 用官方全蛋白切出来的片段作为“参考真相”
     for line in wrap_seq(ref_exon_aa_strict, 60):
         print(f"  {line}")
-
+    if effect_type == "无义突变 (Nonsense)":
+        mut_exon_aa_for_display = ref_exon_aa_strict[:pos_to_report] + '_'
+    else:
+        mut_exon_aa_for_display = mut_exon_aa_strict
     print("\n[外显子严格片段 | 突变后] (起点对齐到同一全蛋白位置 aa {})".format(aa_start_strict))
-    for line in wrap_seq(mut_exon_aa_strict, 60):
+    for line in wrap_seq(mut_exon_aa_for_display, 60):
         print(f"  {line}")
 
-    # 影响类型判定（仅限该严格片段）
+    # 4. 生成并打印详细报告
     print("\n[只看该外显子片段的影响]")
-    if mut_exon_aa_strict == ref_exon_aa_strict:
-        print("  - 变异类型: 同义 (Synonymous) / 片段未改变")
-        return
-
-    # 判断是否移码（看严格片段翻译所用的nt长度变化是否为3的倍数）
-    # 注意：这里只比较该片段内部的变化（不跨外显子）
-    delta_nt = len(mut_part_strict) - len(ref_part_strict)
-    if delta_nt % 3 != 0:
-        effect_type = "移码突变 (Frameshift)"
-    else:
-        # 看是否出现/消失终止（你的translate_dna以'_'为终止）
-        if "_" in mut_exon_aa_strict and "_" not in ref_exon_aa_strict:
-            effect_type = "无义突变 (Nonsense)"
-        elif "_" not in mut_exon_aa_strict and "_" in ref_exon_aa_strict:
-            effect_type = "终止丢失 (Stop-loss)"
-        elif len(mut_exon_aa_strict) != len(ref_exon_aa_strict):
-            effect_type = "插入/缺失（不移码）(In-frame indel)"
-        else:
-            effect_type = "错义突变 (Missense)"
     print(f"  - 变异类型: {effect_type}")
 
-    # 找到片段内首个差异AA并报告对应的全蛋白位置
-    i = 0
-    min_len = min(len(mut_exon_aa_strict), len(ref_exon_aa_strict))
-    while i < min_len and mut_exon_aa_strict[i] == ref_exon_aa_strict[i]:
-        i += 1
-    if i < min_len:
-        aa_global = aa_start_strict + i
-        print(f"  - 首个差异位点（片段内）: 第 {i+1} 个氨基酸（全蛋白位置 aa {aa_global}）")
-        # 打印一个小窗口
-        left = max(0, i-10)
-        right = i+11
+    if 0 <= pos_to_report < max(len(ref_exon_aa_strict), len(mut_exon_aa_for_display) + 1):
+        aa_global = aa_start_strict + pos_to_report
+        ref_aa = ref_exon_aa_strict[pos_to_report] if pos_to_report < len(ref_exon_aa_strict) else '?'
+        mut_aa = mut_exon_aa_for_display[pos_to_report] if pos_to_report < len(mut_exon_aa_for_display) else '?'
+
+        print(f"  - 影响位置: 该外显子翻译片段的第 {pos_to_report + 1} 个氨基酸")
+        print(f"  - 全蛋白位置: 氨基酸 {aa_global}")
+        print(f"  - 具体改变: {ref_aa} -> {mut_aa}")
+        
+        # 打印上下文窗口
+        left = max(0, pos_to_report - 10)
+        right = pos_to_report + 11
         ref_win = ref_exon_aa_strict[left:right]
-        mut_win = mut_exon_aa_strict[left:right]
-        # 用中括号标记差异位点
-        if i-left < len(ref_win):
-            ref_win = ref_win[:i-left] + "[" + ref_win[i-left:i-left+1] + "]" + ref_win[i-left+1:]
-        if i-left < len(mut_win):
-            mut_win = mut_win[:i-left] + "[" + mut_win[i-left:i-left+1] + "]" + mut_win[i-left+1:]
+        mut_win_for_display = mut_exon_aa_for_display[left:right]
+        
+        marked_pos = pos_to_report - left
+        if 0 <= marked_pos < len(ref_win):
+            ref_win = ref_win[:marked_pos] + f"[{ref_win[marked_pos]}]" + ref_win[marked_pos+1:]
+        if 0 <= marked_pos < len(mut_win_for_display):
+             mut_win_for_display = mut_win_for_display[:marked_pos] + f"[{mut_win_for_display[marked_pos]}]" + mut_win_for_display[marked_pos+1:]
+
         print(f"  - 参考窗口: ...{ref_win}...")
-        print(f"  - 突变窗口: ...{mut_win}...")
+        if effect_type != "同义突变 (Synonymous)":
+            print(f"  - 突变窗口: ...{mut_win_for_display}...")
     else:
-        # 长度不同但前缀一致的情况
-        aa_global = aa_start_strict + min_len
-        print(f"  - 片段长度改变，分歧点在末端（全蛋白位置起于 aa {aa_global} 之后）")
+        print(f"  - 片段长度改变或无法精确定位。")
 
     print("=========================================================\n")
+
 
 def process_variant_with_uniprot_workflow(gene_id: str, target_exon_info: dict, ref: str, alt: str,
                                           desc_id, gene_name, variant_position, relative_pos):
@@ -895,10 +935,255 @@ def classify_variant(ref: str, alt: str) -> str:
     else:
         return "Complex (复杂变异)"
 
+# =================================================================
+#  请用下面的【正确版本】替换掉旧的 get_variant_hgvsc 函数
+# =================================================================
+# def get_variant_hgvs(chrom: str, pos: int, ref: str, alt: str, transcript_id: str) -> dict | None:
+#     """
+#     使用 Ensembl VEP API 获取变异在一个特定转录本上的 HGVS 注释（c. 和 p.）
+#     自动根据变异类型构造 variant_str，兼容 SNV / insertion / deletion / substitution。
+#     """
+#     print(f"\n[Phase 2] Calling Ensembl VEP for HGVS notation on transcript {transcript_id}...")
+    
+#     start = pos
+#     end = pos + len(ref) - 1  # REF 的结束坐标
 
-def generate_variant_context_report(desc_id: str):
+#     # 分类构造 variant_str
+#     if ref == "-" or ref == "":  # 插入
+#         # VEP 插入的格式是 start end -/ALT，比如 100 100 -/A
+#         variant_str = f"{chrom} {pos} {pos} -/{alt}"
+#     elif alt == "-" or alt == "":  # 缺失
+#         # 缺失格式：start end REF/-
+#         variant_str = f"{chrom} {start} {end} {ref}/-"
+#     elif len(ref) == len(alt) == 1:  # SNV
+#         variant_str = f"{chrom} {pos} {pos} {ref}/{alt}"
+#     elif len(ref) == len(alt):  # 替换，等长替换
+#         # 替换格式：start end REF/ALT，比如 100 101 GA/TT
+#         variant_str = f"{chrom} {start} {end} {ref}/{alt}"
+#     else:
+#         # insertion 或 deletion 的另一种形式（如 GA/G），需要坐标调整
+#         # 若 ALT 是 REF 的前缀 → deletion
+#         if alt == ref[0]:
+#             # 例如 REF=GA, ALT=G, 表示删除A, 坐标应该覆盖 GA
+#             end = start + len(ref) - 1
+#             variant_str = f"{chrom} {start} {end} {ref}/{alt}"
+#         # 若 REF 是 ALT 的前缀 → insertion
+#         elif ref == alt[0]:
+#             # 例如 REF=G, ALT=GA，表示在G后插入A
+#             variant_str = f"{chrom} {start} {start} -/{alt[1:]}"
+#         else:
+#             # 不规则 indel（罕见情况），直接按替换处理
+#             end = start + len(ref) - 1
+#             variant_str = f"{chrom} {start} {end} {ref}/{alt}"
+
+#     print(f"  > Debug: Sending variant string to VEP: \"{variant_str}\"")
+
+#     ext_vep = "/vep/human/region"
+
+#     try:
+#         r = requests.post(
+#             ENSEMBL_SERVER + ext_vep,
+#             headers=JSON_HEADERS,
+#             data=json.dumps({"variants": [variant_str], "hgvs": 1})
+#         )
+#         r.raise_for_status()
+#         results = r.json()
+
+#         if not results:
+#             print("  > VEP did not return any results.")
+#             return None
+
+#         # 遍历返回结果，找到目标 transcript 的 consequence
+#         for consequence in results[0].get('transcript_consequences', []):
+#             if consequence.get('transcript_id') == transcript_id:
+#                 return consequence
+
+#         print(f"  > VEP did not provide HGVS notation for the target transcript {transcript_id}.")
+#         return None
+
+#     except requests.exceptions.RequestException as err:
+#         print(f"  > VEP API request failed: {err}")
+#         if hasattr(err, 'response') and err.response is not None:
+#             print(f"  > Server response: {err.response.status_code} - {err.response.text}")
+#         return None
+
+def _norm_allele(a: Optional[str]) -> str:
+    """把常见的空占位（None, '.', '-' 等）标准化为空字符串，并去除两端空白。"""
+    if a is None:
+        return ""
+    a = str(a).strip()
+    if a == ".":
+        return ""
+    # 保留 '-' 作为有意义符号的场景较少，统一当成空（表示 insertion/deletion 情况时我们用 start/end + -/ALT 或 REF/-）
+    if a == "-":
+        return ""
+    return a
+
+def get_variant_hgvs(chrom: str, pos: int, ref: Optional[str], alt: Optional[str], transcript_id: str) -> Dict | None:
     """
-    解析 "CHROM_POS_REF_ALT" 格式的ID，并根据变异位置生成上下文序列报告。
+    使用 Ensembl VEP REST API 获取变异在指定转录本上的注释（尽量返回 transcript_consequence 字典）
+
+    本函数对常见的变异表示做了规范化：
+      - 将插入（ref 为 '-' 或空）标准化为 start=pos, end=pos+1, 使用 -/ALT 形式
+      - 将缺失（alt 为 '-' 或空）标准化为 start=pos, end=pos+len(ref)-1, 使用 REF/- 形式
+      - 对等长替换（multi-base substitution）和 SNV 直接用 start/end=pos..pos+len(ref)-1
+      - 对复杂 indel 做合理推断（优先使用 REF/ALT 形式，当 API 报错时尝试一次插入位置修正重试）
+
+    注意：函数假设传入的 pos 是 1-based 的基因组坐标（与 VCF 保持一致）。
+
+    返回：匹配 transcript_id 的 transcript_consequence dict，或 None（失败或未找到）。
+    """
+
+    print(f"\n[Phase 2] Calling Ensembl VEP for HGVS notation on transcript {transcript_id}...")
+
+    # 规范化输入
+    ref = _norm_allele(ref)
+    alt = _norm_allele(alt)
+
+    # 默认 start 使用 pos（用户的 pos 应该是变异开始位点，1-based）
+    start = pos
+
+    # 构造 variant_str
+    variant_str = None
+
+    # 1) 插入（ref 为空）
+    if ref == "":
+        # 大多数 VEP/region 的实现对 "-/ACC" 要求坐标为 start and end = start + 1
+        end = pos + 1
+        variant_str = f"{chrom} {start} {end} -/{alt}"
+
+    # 2) 缺失（alt 为空）
+    elif alt == "":
+        end = pos + len(ref) - 1
+        variant_str = f"{chrom} {start} {end} {ref}/-"
+
+    # 3) 全长替换或 SNV
+    elif len(ref) == len(alt) == 1:
+        end = pos
+        variant_str = f"{chrom} {pos} {pos} {ref}/{alt}"
+    elif len(ref) == len(alt):
+        end = pos + len(ref) - 1
+        variant_str = f"{chrom} {start} {end} {ref}/{alt}"
+
+    # 4) 长度不等的 indel（可能是 GA/G 或 G/GA 等）
+    else:
+        # 如果 alt 以 ref 为前缀 (ALT startswith REF) -> 表示在 REF 之后插入（ALT = REF + inserted）
+        if alt.startswith(ref):
+            # 使用 REF/ALT 形式（这与 VCF 的左锚方式一致）
+            end = pos + len(ref) - 1
+            variant_str = f"{chrom} {start} {end} {ref}/{alt}"
+        # 如果 ref 以 alt 为前缀 -> 表示在 ref 中缺失了后缀部分
+        elif ref.startswith(alt):
+            end = pos + len(ref) - 1
+            variant_str = f"{chrom} {start} {end} {ref}/{alt}"
+        else:
+            # 罕见复杂 indel，采取保守策略：把整个 ref 区间作为替换范围
+            end = pos + len(ref) - 1
+            variant_str = f"{chrom} {start} {end} {ref}/{alt}"
+
+    print(f"  > Debug: Sending variant string to VEP: \"{variant_str}\"")
+
+    ext_vep = "/vep/human/region"
+
+    payload = {"variants": [variant_str], "hgvs": 1}
+
+    try:
+        r = requests.post(ENSEMBL_SERVER + ext_vep, headers=JSON_HEADERS, data=json.dumps(payload))
+        # 如果返回 400 且信息提示坐标与插入不匹配，我们尝试做一次插入坐标修正（兼容部分服务器期望 start=end+1 的古怪校验）
+        if r.status_code == 400:
+            text = r.text or ""
+            # 关键词匹配（宽松）
+            if ("insertion" in text.lower() or "look like an insertion" in text.lower() or "coordinates are not start" in text.lower()):
+                print("  > VEP returned 400 that looks like an insertion/coordinate formatting issue. Trying alternate insertion format and retrying once...")
+                # 备用格式：把 end 设置为 start（有些实现接受 -/ALT 且 start==end）以及另一种把 end 设置为 start+1
+                alt_variants = [f"{chrom} {start} {start+1} -/{alt}", f"{chrom} {start} {start} -/{alt}"]
+                for v in alt_variants:
+                    try_payload = {"variants": [v], "hgvs": 1}
+                    r2 = requests.post(ENSEMBL_SERVER + ext_vep, headers=JSON_HEADERS, data=json.dumps(try_payload))
+                    if r2.status_code == 200:
+                        results = r2.json()
+                        # 找到目标 transcript 的 consequence
+                        for consequence in results[0].get('transcript_consequences', []):
+                            if consequence.get('transcript_id') == transcript_id:
+                                return consequence
+                        # 没有找到匹配 transcript 则返回第一条结果（或 None）
+                        if results and results[0].get('transcript_consequences'):
+                            return results[0]['transcript_consequences'][0]
+                        return None
+                # 如果两个备用格式都失败，抛出原始错误以便下面 except 处理
+                r.raise_for_status()
+        # 正常 200 路径
+        r.raise_for_status()
+        results = r.json()
+
+        if not results:
+            print("  > VEP did not return any results.")
+            return None
+
+        for consequence in results[0].get('transcript_consequences', []):
+            if consequence.get('transcript_id') == transcript_id:
+                return consequence
+
+        # 如果没找到指定 transcript，返回 None
+        print(f"  > VEP did not provide HGVS notation for the target transcript {transcript_id}.")
+        return None
+
+    except requests.exceptions.RequestException as err:
+        print(f"  > VEP API request failed: {err}")
+        if hasattr(err, 'response') and err.response is not None:
+            print(f"  > Server response: {err.response.status_code} - {err.response.text}")
+        return None
+
+
+def parse_hgvsp(hgvsp: str) -> Optional[Dict]:
+    """
+    解析 HGVS p. 字符串 (例如 'p.Trp24Cys') 并返回一个包含关键信息的字典。
+    支持 missense, nonsense, 和 frameshift (只解析起始点)。
+    """
+    if not hgvsp or ':p.' not in hgvsp:
+        return None
+
+    try:
+        p_part = hgvsp.split(':p.', 1)[1]
+        
+        # 正则表达式匹配 氨基酸(3位) + 位置 + 变化
+        # 变化部分可以是 氨基酸(3位), Ter(终止), 或者 fs... (移码)
+        match = re.match(r'^([A-Z][a-z]{2})(\d+)([A-Z][a-z]{2}|Ter|fs.*)$', p_part)
+        
+        if not match:
+            # 无法匹配，可能是同义突变 p.(=) 或其他复杂情况
+            return None
+
+        before_3 = match.group(1)
+        position = int(match.group(2))
+        after_raw = match.group(3)
+
+        before_1 = AA_3TO1.get(before_3)
+        after_1 = None
+
+        if after_raw.startswith('fs'):
+            # 对于移码，我们只知道起始变化，后续是未知的
+            # VEP有时会提供第一个变化的氨基酸，例如 p.Leu397HisfsTer25
+            fs_match = re.match(r'^([A-Z][a-z]{2})', after_raw)
+            if fs_match:
+                after_1 = AA_3TO1.get(fs_match.group(1), 'Frameshift')
+            else:
+                 after_1 = 'Frameshift'
+        else:
+            after_1 = AA_3TO1.get(after_raw)
+
+        if before_1 is None or after_1 is None:
+            return None
+
+        return {'position': position, 'before': before_1, 'after': after_1}
+
+    except (AttributeError, IndexError):
+        return None
+
+def generate_variant_context_report_raw(desc_id: str):
+    """
+    重构后的核心分析函数。
+    新逻辑：先通过UniProt锚定找到“功能转录本”，然后以此为唯一标准进行后续判断和分析。
     """
     print("\n--- 开始处理该位点的ID上下文序列 ---")
     print(f"===== 开始处理ID: {desc_id} =====")
@@ -913,6 +1198,7 @@ def generate_variant_context_report(desc_id: str):
         print(f"错误：ID '{desc_id}' 格式不正确，已跳过序列分析。")
         return
     
+    # 步骤 1: 确定变异所在基因
     gene_name, gene_id = "N/A", "N/A"
     try:
         ext_overlap = f"/overlap/region/human/{chromosome}:{variant_position}-{variant_position}?feature=gene"
@@ -923,37 +1209,100 @@ def generate_variant_context_report(desc_id: str):
             gene_info = overlap_data[0]
             gene_id, gene_name = gene_info.get('id'), gene_info.get('external_name', 'N/A')
     except requests.exceptions.RequestException:
-        pass # 静默处理错误，后续流程会按基因间区处理
-    
-    '''寻找对应的外显子'''
-    target_exon = None
-    if gene_id != "N/A":
-        try:
-            ext_lookup = f"/lookup/id/{gene_id}?expand=1"
-            r_lookup = requests.get(ENSEMBL_SERVER + ext_lookup, headers=JSON_HEADERS)
-            r_lookup.raise_for_status()
-            gene_data = r_lookup.json()
-            transcript = next((t for t in gene_data.get('Transcript', []) if t.get('is_canonical')), 
-                              gene_data.get('Transcript', [{}])[0])
-            all_exons = transcript.get('Exon', [])
-            for i, exon in enumerate(all_exons):
-                if exon['start'] <= variant_position <= exon['end']:
-                    target_exon = exon
-                    target_exon['number'] = i + 1
-                    target_exon['total_count'] = len(all_exons)
-                    break
-        except (requests.exceptions.RequestException, IndexError, KeyError):
-            pass # 静默处理错误，后续流程会按内含子处理
+        pass
 
-    if target_exon:
-        target_exon['variant_pos'] = variant_position
-        exon_chr, exon_start, exon_end = target_exon['seq_region_name'], target_exon['start'], target_exon['end']
-        relative_pos = variant_position - exon_start
-        '''
-        执行从基因到单外显子翻译的完整UniProt锚定工作流
-        '''
-        process_variant_with_uniprot_workflow(gene_id, target_exon, ref_allele, alt_allele,desc_id,gene_name,variant_position, relative_pos)
-    else:
+    # 标志位，用于决定最终是执行蛋白质分析还是简单的侧翼序列报告
+    protein_analysis_completed = False
+    
+    if gene_id != "N/A":
+        # --- 新增的核心逻辑 ---
+        # 步骤 2: 不再使用标准转录本，而是直接开始UniProt锚定流程，寻找“功能转录本”
+        print(f"\n[Phase 1] 基因 {gene_name} ({gene_id}) 已定位。开始通过UniProt锚定寻找功能转录本...")
+        
+        uniprot_id = get_uniprot_id_for_gene_debug(gene_id)
+        protein_seq = get_protein_sequence_from_uniprot(uniprot_id) if uniprot_id else None
+        matched_transcript = find_transcript_by_protein_sequence(gene_id, protein_seq) if protein_seq else None
+
+        # 步骤 3: 基于找到的“功能转录本”进行决策
+        if matched_transcript:
+            t_id = matched_transcript['id']
+            print(f"  > 成功: 已锁定功能转录本 {t_id}")
+            transcript_full = fetch_transcript_full(t_id)
+            
+            # 步骤 4: 在“功能转录本”上查找变异所在的外显子
+            target_exon = find_exon_on_transcript(transcript_full, variant_position)
+            result = get_variant_hgvs(chromosome, variant_position, ref_allele, alt_allele, t_id)
+            if target_exon:
+                translation_info = transcript_full.get("Translation")
+
+                if translation_info:
+                    # 对于编码转录本，获取其CDS的起止坐标
+                    cds_start = translation_info.get('start')
+                    cds_end = translation_info.get('end')
+                    cds_min = min(cds_start, cds_end)
+                    cds_max = max(cds_start, cds_end)
+                    # 核心判断：变异位置是否在CDS坐标范围内
+                    if cds_min <= variant_position <= cds_max:
+                        # 情况A: 变异位于外显子的【编码区】
+                        print("  > 结论: 变异位于外显子的编码区 (CDS)。")
+                        hgvsp = result.get('hgvsp')
+                        print(f"变异预览：{hgvsp}")
+                        analyze_exon_location(target_exon, transcript_full)
+                        print("  > 开始进行蛋白质影响分析...")
+                        report_full_protein_and_exon_effect(
+                            transcript_full, target_exon, ref_allele, alt_allele, variant_position
+                        )
+                        protein_analysis_completed = True
+                    else:
+                        # 情况B: 变异位于外显子的【非编码区 UTR】
+                        utr_type = "5' UTR" if variant_position < cds_min else "3' UTR"
+                        print(f"  > 结论: 变异位于外显子的非编码区 ({utr_type})，不影响蛋白质序列。")
+                        category = f"exon_{utr_type}" # e.g., exon_5UTR
+                        # 此处不进行蛋白质影响分析，会降级到末尾的侧翼序列报告
+                else:
+                    # 情况C: 这是一个非编码转录本，所有外显子都是非编码的
+                    print("  > 结论: 变异位于非编码转录本的外显子中。")
+                    category = "non_coding_exon"
+            else:
+                # 调用 VEP 获取 HGVS cDNA 坐标
+                if result:
+                    hgvsc = result.get('hgvsc')
+                if hgvsc and ':c.' in hgvsc:
+                # 步骤 3: 解析 HGVS 坐标进行精确判断
+                    print(f"变体落在非外显子区域，开始判断是否位于剪切区域内。。。")
+                    cdna_part = hgvsc.split(':c.')[1]
+                    m_pos = re.match(r'^(-?\d+(?:[+\-]\d+)?)', cdna_part)
+                    if not m_pos:
+                        print("  > 无法解析 c. 坐标中的位置部分。")
+                        
+                    pos_part = m_pos.group(1)
+                    m_intronic = re.match(r'^(-?\d+)([+\-])(\d+)$', pos_part)
+                    if m_intronic:
+                        base = int(m_intronic.group(1))   # 可能为负数，例如 -2
+                        sign = m_intronic.group(2)        # '+' or '-'
+                        offset = int(m_intronic.group(3)) # 内含子侧距离
+
+                        # 判断是否属于关键剪接位点（+1/+2 或 -1/-2）
+                        if offset in (1, 2):
+                            splice_type = "splice_donor_variant" if sign == '+' else "splice_acceptor_variant"
+                            category = "splice_site"
+                            print(f"  > VEP结论: 变异位于关键剪接位点 ({splice_type})。")
+                        elif (sign == '+' and offset <= DONOR_SPLICE_REGION_MAX) or (sign == '-' and offset <= ACCEPTOR_SPLICE_REGION_MAX):
+                            splice_type = "splice_region_variant"
+                            category = "splice_region"
+                            print(f"  > VEP结论: 变异位于剪接邻近区域 ({splice_type})，距离外显子边界 {offset} nt。")
+                        else:
+                            splice_type = None
+                            category = "intron"
+                            print(f"  > 结论: 变异位于内含子（距离外显子边界 {offset} nt），不在常见剪接邻域。")
+        else:
+            # 4c: 如果无法通过UniProt找到匹配的转录本
+            print("  > 未能找到与UniProt蛋白匹配的转录本。")
+            
+    # --- 统一的降级处理逻辑 ---
+    # 如果是基因间区，或无法完成蛋白质分析的任何情况（如内含子、无UniProt匹配等），则执行侧翼序列报告
+    if not protein_analysis_completed:
+        print("  > 降级处理: 生成该位点的侧翼DNA序列上下文报告。")
         flank_size = 30
         ref_len = len(ref_allele)
         start_fetch = variant_position - flank_size
@@ -963,7 +1312,148 @@ def generate_variant_context_report(desc_id: str):
             r_seq = requests.get(ENSEMBL_SERVER + ext_sequence, headers=JSON_HEADERS)
             r_seq.raise_for_status()
             sequence = r_seq.json().get('seq')
-            print_flanking_report(desc_id, gene_name, gene_id, chromosome, variant_position, sequence, flank_size, ref_allele, alt_allele)
+            print_flanking_report(desc_id, gene_name, gene_id, chromosome, variant_position, sequence, flank_size, ref_allele, alt_allele,category)
+        except requests.exceptions.RequestException as err:
+            print(f"错误：获取序列片段失败。原因: {err}")
+
+def generate_variant_context_report(desc_id: str):
+    """
+    (重构版)
+    新逻辑：
+    1. 通过 UniProt 锚定找到功能转录本。
+    2. 调用 VEP API 获取该变异在转录本上的 HGVS cDNA 坐标。
+    3. 解析 HGVS 坐标，精确判断变异是位于外显子还是剪接区域。
+    4. 根据判断结果执行相应的报告流程。
+    """
+    print("\n--- 开始处理该位点的ID上下文序列 ---")
+    print(f"===== 开始处理ID: {desc_id} =====")
+    
+    # 兼容 "_" 和 "-" 作为分隔符
+    try:
+        parts = desc_id.replace('-', '_').split('_')
+        chrom_code, pos_str, ref_allele, alt_allele = parts
+        variant_position = int(pos_str)
+        # VEP API 直接使用 'Y' 和 'X'
+        chromosome_map = {'24': 'Y', '23': 'X'}
+        chromosome = chromosome_map.get(chrom_code, chrom_code)
+    except (ValueError, IndexError):
+        print(f"错误：ID '{desc_id}' 格式不正确，已跳过序列分析。")
+        return
+    
+    # 步骤 1: 确定基因和功能转录本 (逻辑不变)
+    gene_name, gene_id = "N/A", "N/A"
+    # ... (此处省略获取 gene_id 和 gene_name 的代码，与您原文件保持一致)
+    try:
+        ext_overlap = f"/overlap/region/human/{chromosome}:{variant_position}-{variant_position}?feature=gene"
+        r_overlap = requests.get(ENSEMBL_SERVER + ext_overlap, headers=JSON_HEADERS)
+        r_overlap.raise_for_status()
+        overlap_data = r_overlap.json()
+        if overlap_data:
+            gene_info = overlap_data[0]
+            gene_id, gene_name = gene_info.get('id'), gene_info.get('external_name', 'N/A')
+    except requests.exceptions.RequestException:
+        pass
+
+    protein_analysis_completed = False
+    
+    if gene_id != "N/A":
+        print(f"\n[Phase 1] 基因 {gene_name} ({gene_id}) 已定位。开始通过UniProt锚定寻找功能转录本...")
+        uniprot_id = get_uniprot_id_for_gene_debug(gene_id)
+        protein_seq = get_protein_sequence_from_uniprot(uniprot_id) if uniprot_id else None
+        matched_transcript = find_transcript_by_protein_sequence(gene_id, protein_seq) if protein_seq else None
+
+        if matched_transcript:
+            t_id = matched_transcript['id']
+            print(f"  > 成功: 已锁定功能转录本 {t_id}")
+            transcript_full = fetch_transcript_full(t_id)
+
+            # 步骤 2: 调用 VEP 获取 HGVS cDNA 坐标
+            result = get_variant_hgvs(chromosome, variant_position, ref_allele, alt_allele, t_id)
+            if result:
+                hgvsc = result.get('hgvsc')
+                hgvsp = result.get('hgvsp')
+            if hgvsc and ':c.' in hgvsc:
+                # 步骤 3: 解析 HGVS 坐标进行精确判断
+                cdna_part = hgvsc.split(':c.')[1]
+                print(f"获取到的HGVS信息:   {cdna_part}")
+                m_pos = re.match(r'^(-?\d+(?:[+\-]\d+)?)', cdna_part)
+                if not m_pos:
+                    print("  > 无法解析 c. 坐标中的位置部分。")
+                pos_part = m_pos.group(1)
+                # pos_part 现在可能是: "-2-6" 或 "89+3" 或 "85"
+
+                # 匹配 intronic pattern： base (+/-) offset，例如 "-2-6" 或 "89+3" 或 "100-2"
+                m_intronic = re.match(r'^(-?\d+)([+\-])(\d+)$', pos_part)
+                m_utr5 = re.match(r'^-(\d+)', cdna_part)
+                m_utr3 = re.match(r'^\*(\d+)', cdna_part)
+                if m_intronic:
+                    base = int(m_intronic.group(1))   # 可能为负数，例如 -2
+                    sign = m_intronic.group(2)        # '+' or '-'
+                    offset = int(m_intronic.group(3)) # 内含子侧距离
+
+                    # 判断是否属于关键剪接位点（+1/+2 或 -1/-2）
+                    if offset in (1, 2):
+                        splice_type = "splice_donor_variant" if sign == '+' else "splice_acceptor_variant"
+                        category = "splice_site"
+                        print(f"  > VEP结论: 变异位于关键剪接位点 ({splice_type})。")
+                    elif (sign == '+' and offset <= DONOR_SPLICE_REGION_MAX) or (sign == '-' and offset <= ACCEPTOR_SPLICE_REGION_MAX):
+                        splice_type = "splice_region_variant"
+                        category = "splice_region"
+                        print(f"  > VEP结论: 变异位于剪接邻近区域 ({splice_type})，距离外显子边界 {offset} nt。")
+                    else:
+                        splice_type = None
+                        category = "intron"
+                        print(f"  > 结论: 变异位于内含子（距离外显子边界 {offset} nt），不在常见剪接邻域。")
+                
+                elif m_utr5:
+                    distance = int(m_utr5.group(1))
+                    category = "5UTR"
+                    print(f"  > VEP结论: 变异位于 5′UTR 区域（起始密码子上游 {distance} nt）。")
+                    
+
+                # ========== 3️⃣ 判断 3′UTR 区域 ==========
+                # 3′UTR 使用 *坐标，如 c.*93T>C
+                elif m_utr3:
+                    distance = int(m_utr3.group(1))
+                    category = "3UTR"
+                    print(f"  > VEP结论: 变异位于 3′UTR 区域（终止密码子下游 {distance} nt）。")
+                    
+                
+                else:
+                    consequences = result.get('consequence_terms', [])
+
+                    print(f"  > VEP结论: {', '.join(consequences)}")
+                    if hgvsp:
+                        print(f"  > 蛋白质影响 (HGVS p.): {hgvsp}")
+                    protein_analysis_completed = True
+                    # # 如果不是带 +/- 的内含子形式，那就是外显子或 UTR 的位置（例如 c.85 或 c.-12）
+                    # print("  > VEP结论: 变异位于外显子或 UTR 区，进行蛋白质影响分析...")
+                    # # 注意：这里假设 variant_position 是你本地图谱上的可用坐标（genomic 或 cDNA，取决于 find_exon_on_transcript 的实现）
+                    # target_exon = find_exon_on_transcript(transcript_full, variant_position)
+                    # if target_exon:
+                    #     analyze_exon_location(target_exon, transcript_full)
+                    #     # 4a: 如果变异在功能转录本的外显子上，则执行完整的蛋白质影响分析
+                    #     print("  > 结论: 变异位于功能转录本的外显子上。开始进行蛋白质影响分析...")
+                    #     report_full_protein_and_exon_effect(
+                    #         transcript_full, target_exon, ref_allele, alt_allele, variant_position
+                    #     )
+                    #     protein_analysis_completed = True
+                    # else:
+                    #     print("  > 错误: VEP 与本地外显子定位不一致，降级处理。")
+        
+    # 降级处理逻辑 (保持不变)
+    if not protein_analysis_completed:
+        print("  > 降级处理: 生成该位点的侧翼DNA序列上下文报告。")
+        flank_size = 30
+        ref_len = len(ref_allele)
+        start_fetch = variant_position - flank_size
+        end_fetch = (variant_position + ref_len - 1) + flank_size
+        try:
+            ext_sequence = f"/sequence/region/human/{chromosome}:{start_fetch}-{end_fetch}"
+            r_seq = requests.get(ENSEMBL_SERVER + ext_sequence, headers=JSON_HEADERS)
+            r_seq.raise_for_status()
+            sequence = r_seq.json().get('seq')
+            print_flanking_report(desc_id, gene_name, gene_id, chromosome, variant_position, sequence, flank_size, ref_allele, alt_allele,category)
         except requests.exceptions.RequestException as err:
             print(f"错误：获取序列片段失败。原因: {err}")
 
@@ -990,25 +1480,70 @@ def print_exon_report(desc_id, gene_name, gene_id, exon, sequence, mutated_exon_
     print(f"\n======================================================================")
     print("报告结束。")
     
-def print_flanking_report(desc_id, gene_name, gene_id, chrom, var_pos, sequence, flank, ref_allele, alt_allele):
-    """格式化打印内含子/基因间区报告，并新增序列比对功能"""
-    context_type = "内含子" if gene_name != "N/A" else "基因间区"
+# def print_flanking_report(desc_id, gene_name, gene_id, chrom, var_pos, sequence, flank, ref_allele, alt_allele,category):
+#     """格式化打印内含子/基因间区报告，并新增序列比对功能"""
+#     print(f"\n======================================================================")
+#     print(f"      {category} 上下文序列报告")
+#     print(f"      查询ID: {desc_id}")
+#     print(f"      所属基因: {gene_name} ({gene_id})")
+#     print(f"======================================================================")
+#     print(f"\n【目标区域信息】")
+#     print(f"  - 查询坐标:   chr{chrom}:{var_pos}")
+#     print(f"  - 侧翼长度:   每侧 {flank} bp")
+
+#     mutated_sequence = sequence[:flank] + alt_allele + sequence[flank + len(ref_allele):]
+    
+#     print("\n【序列比对】")
+#     print(f"  - 原始片段序列 (Reference):")
+#     print(f"    {sequence}")
+#     print(f"  - 突变后片段序列 (Mutated):")
+#     print(f"    {mutated_sequence}")
+#     print(f"\n======================================================================")
+#     print("报告结束。")
+
+# =================================================================
+#  请用下面的【最终优化版】替换掉旧的 print_flanking_report 函数
+# =================================================================
+
+def print_flanking_report(desc_id, gene_name, gene_id, chrom, var_pos, sequence, flank, ref_allele, alt_allele, category):
+    """
+    (优化版) 格式化打印内含子/基因间区报告。
+    使用截取窗口、括号和颜色来高亮显示变异。
+    """
+    # 定义用于着色的 ANSI 转义序列
+    class Colors:
+        RED = '\033[91m'
+        GREEN = '\033[92m'
+        ENDC = '\033[0m'
+
+    # 确定上下文窗口大小
+    display_window = 15
+
+    # 从完整序列中分离出侧翼
+    left_flank = sequence[:flank]
+    right_flank = sequence[flank + len(ref_allele):]
+
+    # 截取用于显示的窗口
+    display_left = "..." + left_flank[-display_window:] if len(left_flank) > display_window else left_flank
+    display_right = right_flank[:display_window] + "..." if len(right_flank) > display_window else right_flank
+
+    # 构建格式化的参考序列和突变序列字符串
+    formatted_ref = f"{display_left}{Colors.RED}[{ref_allele}]{Colors.ENDC}{display_right}"
+    formatted_mut = f"{display_left}{Colors.GREEN}[{alt_allele}]{Colors.ENDC}{display_right}"
+
+    # --- 开始打印报告 ---
     print(f"\n======================================================================")
-    print(f"      {context_type} 上下文序列报告")
+    print(f"      {category.upper()} 上下文序列报告")
     print(f"      查询ID: {desc_id}")
     print(f"      所属基因: {gene_name} ({gene_id})")
     print(f"======================================================================")
     print(f"\n【目标区域信息】")
     print(f"  - 查询坐标:   chr{chrom}:{var_pos}")
-    print(f"  - 侧翼长度:   每侧 {flank} bp")
+    print(f"  - 变异类型:   {category.replace('_', ' ').title()}")
 
-    mutated_sequence = sequence[:flank] + alt_allele + sequence[flank + len(ref_allele):]
-    
     print("\n【序列比对】")
-    print(f"  - 原始片段序列 (Reference):")
-    print(f"    {sequence}")
-    print(f"  - 突变后片段序列 (Mutated):")
-    print(f"    {mutated_sequence}")
+    print(f"  - 参考序列 (Reference): {formatted_ref}")
+    print(f"  - 突变序列 (Mutated):   {formatted_mut}")
     print(f"\n======================================================================")
     print("报告结束。")
 
@@ -1052,7 +1587,7 @@ def read_vcf_and_process(file_path: str, record_limit: int = 5):
         if record.ID:
             for single_id in record.ID:
                 if '_' in single_id and len(single_id.split('_')) == 4:
-                    generate_variant_context_report(single_id)
+                    generate_variant_context_report_raw(single_id)
                 else:
                     print(f"\nID '{single_id}' 不符合 'CHROM_POS_REF_ALT' 格式，已跳过序列分析。")
         else:
@@ -1064,10 +1599,13 @@ def read_vcf_and_process(file_path: str, record_limit: int = 5):
 #     vcf_file_path = "rgc_me_variant_frequencies_chrY_20231004.vcf"
     
 #     # 默认只处理文件的前3条记录，您可以修改此数字
-#     read_vcf_and_process(file_path=vcf_file_path, record_limit=3)
+#     read_vcf_and_process(file_path=vcf_file_path, record_limit=100)
 
 # 调试脚本
 if __name__ == "__main__":
     
-     generate_variant_context_report("24_3579880_G_A")
-    #generate_variant_context_report("24_2979940_T_A")
+    generate_variant_context_report_raw("24_12725143_G_GT")
+    #generate_variant_context_report_raw("24_12738176_ATATCT_A")
+    #generate_variant_context_report_raw("24_2787019_C_A")
+    #generate_variant_context_report_raw("24_12738152_T_G")
+    
